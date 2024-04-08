@@ -1,6 +1,6 @@
 module github.com/ppoonk/shy/core
 
-go 1.21
+go 1.22.2
 
 require (
 	github.com/apernet/quic-go v0.40.1-0.20231112225043-e7f3af208dee

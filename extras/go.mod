@@ -1,6 +1,6 @@
 module github.com/ppoonk/shy/extras
 
-go 1.21
+go 1.22.2
 
 require (
 	github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6
