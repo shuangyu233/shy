@@ -13,9 +13,9 @@ country=''
 appName='shy'
 
 latestVersion=''
-downloadPrefix='https://github.com/ppoonk/shy/releases/download/'
-githubApi="https://api.github.com/repos/ppoonk/shy/releases/latest"
-manageScript="https://raw.githubusercontent.com/ppoonk/shy/main/scripts/install.sh"
+downloadPrefix='https://github.com/shuangyu233/shy/releases/download/'
+githubApi="https://api.github.com/repos/shuangyu233/shy/releases/latest"
+manageScript="https://raw.githubusercontent.com/shuangyu233/shy/main/scripts/install.sh"
 acmeGit="https://github.com/acmesh-official/acme.sh.git"
 
 
