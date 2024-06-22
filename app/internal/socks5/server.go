@@ -7,7 +7,7 @@ import (
 
 	"github.com/txthinking/socks5"
 
-	"github.com/ppoonk/shy/core/client"
+	"github.com/apernet/hysteria/core/v2/client"
 )
 
 const udpBufferSize = 4096

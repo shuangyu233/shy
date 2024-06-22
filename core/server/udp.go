@@ -8,9 +8,9 @@ import (
 
 	"github.com/apernet/quic-go"
 
-	"github.com/ppoonk/shy/core/internal/frag"
-	"github.com/ppoonk/shy/core/internal/protocol"
-	"github.com/ppoonk/shy/core/internal/utils"
+	"github.com/apernet/hysteria/core/v2/internal/frag"
+	"github.com/apernet/hysteria/core/v2/internal/protocol"
+	"github.com/apernet/hysteria/core/v2/internal/utils"
 )
 
 const (
@@ -20,6 +20,7 @@ const (
 type udpIO interface {
 	ReceiveMessage() (*protocol.UDPMessage, error)
 	SendMessage([]byte, *protocol.UDPMessage) error
+	Hook(data []byte, reqAddr *string) error
 	UDP(reqAddr string) (UDPConn, error)
 }
 
@@ -29,11 +30,12 @@ type udpEventLogger interface {
 }
 
 type udpSessionEntry struct {
-	ID      uint32
-	Conn    UDPConn
-	D       *frag.Defragger
-	Last    *utils.AtomicTime
-	Timeout bool // true if the session is closed due to timeout
+	ID           uint32
+	Conn         UDPConn
+	OverrideAddr string // Ignore the address in the UDP message, always use this if not empty
+	D            *frag.Defragger
+	Last         *utils.AtomicTime
+	Timeout      bool // true if the session is closed due to timeout
 }
 
 // Feed feeds a UDP message to the session.
@@ -47,7 +49,11 @@ func (e *udpSessionEntry) Feed(msg *protocol.UDPMessage) (int, error) {
 	if dfMsg == nil {
 		return 0, nil
 	}
-	return e.Conn.WriteTo(dfMsg.Data, dfMsg.Addr)
+	if e.OverrideAddr != "" {
+		return e.Conn.WriteTo(dfMsg.Data, e.OverrideAddr)
+	} else {
+		return e.Conn.WriteTo(dfMsg.Data, dfMsg.Addr)
+	}
 }
 
 // ReceiveLoop receives incoming UDP packets, packs them into UDP messages,
@@ -84,11 +90,11 @@ func (e *udpSessionEntry) ReceiveLoop(io udpIO) error {
 // fragmenting the message.
 func sendMessageAutoFrag(io udpIO, buf []byte, msg *protocol.UDPMessage) error {
 	err := io.SendMessage(buf, msg)
-	var errTooLarge quic.ErrMessageTooLarge
+	var errTooLarge *quic.DatagramTooLargeError
 	if errors.As(err, &errTooLarge) {
 		// Message too large, try fragmentation
 		msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
-		fMsgs := frag.FragUDPMessage(msg, int(errTooLarge))
+		fMsgs := frag.FragUDPMessage(msg, int(errTooLarge.MaxDataLen))
 		for _, fMsg := range fMsgs {
 			err := io.SendMessage(buf, &fMsg)
 			if err != nil {
@@ -177,7 +183,15 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 
 	// Create a new session if not exists
 	if entry == nil {
+		// Call the hook
+		origMsgAddr := msg.Addr
+		err := m.io.Hook(msg.Data, &msg.Addr)
+		if err != nil {
+			return
+		}
+		// Log the event
 		m.eventLogger.New(msg.SessionID, msg.Addr)
+		// Dial target & create a new session entry
 		conn, err := m.io.UDP(msg.Addr)
 		if err != nil {
 			m.eventLogger.Close(msg.SessionID, err)
@@ -188,6 +202,10 @@ func (m *udpSessionManager) feed(msg *protocol.UDPMessage) {
 			Conn: conn,
 			D:    &frag.Defragger{},
 			Last: utils.NewAtomicTime(time.Now()),
+		}
+		if origMsgAddr != msg.Addr {
+			// Hook changed the address, enable address override
+			entry.OverrideAddr = msg.Addr
 		}
 		// Start the receive loop for this session
 		go func() {

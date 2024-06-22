@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/apernet/go-tproxy"
-	"github.com/ppoonk/shy/core/client"
+	"github.com/apernet/hysteria/core/v2/client"
 )
 
 const (

@@ -6,35 +6,43 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/ppoonk/shy/app/api"
-	"github.com/ppoonk/shy/app/api/airgo"
-	"github.com/robfig/cron/v3"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/caddyserver/certmagic"
+	"github.com/libdns/cloudflare"
+	"github.com/libdns/duckdns"
+	"github.com/libdns/gandi"
+	"github.com/libdns/godaddy"
+	"github.com/libdns/namedotcom"
+	"github.com/libdns/vultr"
 	"github.com/mholt/acmez/acme"
-	_ "github.com/robfig/cron/v3"
+	"github.com/robfig/cron/v3"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
-	"github.com/ppoonk/shy/app/internal/utils"
-	"github.com/ppoonk/shy/core/server"
-	"github.com/ppoonk/shy/extras/masq"
-	"github.com/ppoonk/shy/extras/obfs"
-	"github.com/ppoonk/shy/extras/outbounds"
-	"github.com/ppoonk/shy/extras/trafficlogger"
+	"github.com/apernet/hysteria/app/v2/api/api/airgo"
+	"github.com/apernet/hysteria/app/v2/internal/utils"
+	"github.com/apernet/hysteria/core/v2/server"
+	"github.com/apernet/hysteria/extras/v2/correctnet"
+	"github.com/apernet/hysteria/extras/v2/masq"
+	"github.com/apernet/hysteria/extras/v2/obfs"
+	"github.com/apernet/hysteria/extras/v2/outbounds"
+	"github.com/apernet/hysteria/extras/v2/trafficlogger"
+	"github.com/ppoonk/shy/app/api"
 )
 
 const (
 	defaultListenAddr  = ":443"
 	trafficStatsListen = "127.0.0.1:7654" //默认流量统计 API
+
 )
 
 var serverCmd = &cobra.Command{
@@ -42,8 +50,13 @@ var serverCmd = &cobra.Command{
 	Short: "Server mode",
 	Run:   runServer,
 }
+
 var apiClient api.Api
 var crontab *cron.Cron
+
+func init() {
+	rootCmd.AddCommand(serverCmd)
+}
 
 type serverConfig struct {
 	Panel                 api.Panel                   `mapstructure:"panel"`
@@ -54,6 +67,7 @@ type serverConfig struct {
 	QUIC                  serverConfigQUIC            `mapstructure:"quic"`
 	Bandwidth             serverConfigBandwidth       `mapstructure:"bandwidth"`
 	IgnoreClientBandwidth bool                        `mapstructure:"ignoreClientBandwidth"`
+	SpeedTest             bool                        `mapstructure:"speedTest"`
 	DisableUDP            bool                        `mapstructure:"disableUDP"`
 	UDPIdleTimeout        time.Duration               `mapstructure:"udpIdleTimeout"`
 	Auth                  serverConfigAuth            `mapstructure:"auth"`
@@ -79,14 +93,38 @@ type serverConfigTLS struct {
 }
 
 type serverConfigACME struct {
-	Domains        []string `mapstructure:"domains"`
-	Email          string   `mapstructure:"email"`
-	CA             string   `mapstructure:"ca"`
-	DisableHTTP    bool     `mapstructure:"disableHTTP"`
-	DisableTLSALPN bool     `mapstructure:"disableTLSALPN"`
-	AltHTTPPort    int      `mapstructure:"altHTTPPort"`
-	AltTLSALPNPort int      `mapstructure:"altTLSALPNPort"`
-	Dir            string   `mapstructure:"dir"`
+	// Common fields
+	Domains    []string `mapstructure:"domains"`
+	Email      string   `mapstructure:"email"`
+	CA         string   `mapstructure:"ca"`
+	ListenHost string   `mapstructure:"listenHost"`
+	Dir        string   `mapstructure:"dir"`
+
+	// Type selection
+	Type string               `mapstructure:"type"`
+	HTTP serverConfigACMEHTTP `mapstructure:"http"`
+	TLS  serverConfigACMETLS  `mapstructure:"tls"`
+	DNS  serverConfigACMEDNS  `mapstructure:"dns"`
+
+	// Legacy fields for backwards compatibility
+	// Only applicable when Type is empty
+	DisableHTTP    bool `mapstructure:"disableHTTP"`
+	DisableTLSALPN bool `mapstructure:"disableTLSALPN"`
+	AltHTTPPort    int  `mapstructure:"altHTTPPort"`
+	AltTLSALPNPort int  `mapstructure:"altTLSALPNPort"`
+}
+
+type serverConfigACMEHTTP struct {
+	AltPort int `mapstructure:"altPort"`
+}
+
+type serverConfigACMETLS struct {
+	AltPort int `mapstructure:"altPort"`
+}
+
+type serverConfigACMEDNS struct {
+	Name   string            `mapstructure:"name"`
+	Config map[string]string `mapstructure:"config"`
 }
 
 type serverConfigQUIC struct {
@@ -257,11 +295,26 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 		if c.TLS.Cert == "" || c.TLS.Key == "" {
 			return configError{Field: "tls", Err: errors.New("empty cert or key path")}
 		}
-		cert, err := tls.LoadX509KeyPair(c.TLS.Cert, c.TLS.Key)
+		// Try loading the cert-key pair here to catch errors early
+		// (e.g. invalid files or insufficient permissions)
+		certPEMBlock, err := os.ReadFile(c.TLS.Cert)
 		if err != nil {
-			return configError{Field: "tls", Err: err}
+			return configError{Field: "tls.cert", Err: err}
 		}
-		hyConfig.TLSConfig.Certificates = []tls.Certificate{cert}
+		keyPEMBlock, err := os.ReadFile(c.TLS.Key)
+		if err != nil {
+			return configError{Field: "tls.key", Err: err}
+		}
+		_, err = tls.X509KeyPair(certPEMBlock, keyPEMBlock)
+		if err != nil {
+			return configError{Field: "tls", Err: fmt.Errorf("invalid cert-key pair: %w", err)}
+		}
+		// Use GetCertificate instead of Certificates so that
+		// users can update the cert without restarting the server.
+		hyConfig.TLSConfig.GetCertificate = func(info *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			cert, err := tls.LoadX509KeyPair(c.TLS.Cert, c.TLS.Key)
+			return &cert, err
+		}
 	} else {
 		// ACME
 		dataDir := c.ACME.Dir
@@ -279,13 +332,10 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			Logger:             logger,
 		}
 		cmIssuer := certmagic.NewACMEIssuer(cmCfg, certmagic.ACMEIssuer{
-			Email:                   c.ACME.Email,
-			Agreed:                  true,
-			DisableHTTPChallenge:    c.ACME.DisableHTTP,
-			DisableTLSALPNChallenge: c.ACME.DisableTLSALPN,
-			AltHTTPPort:             c.ACME.AltHTTPPort,
-			AltTLSALPNPort:          c.ACME.AltTLSALPNPort,
-			Logger:                  logger,
+			Email:      c.ACME.Email,
+			Agreed:     true,
+			ListenHost: c.ACME.ListenHost,
+			Logger:     logger,
 		})
 		switch strings.ToLower(c.ACME.CA) {
 		case "letsencrypt", "le", "":
@@ -299,8 +349,82 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			}
 			cmIssuer.ExternalAccount = eab
 		default:
-			return configError{Field: "acme.ca", Err: errors.New("unknown CA")}
+			return configError{Field: "acme.ca", Err: errors.New("unsupported CA")}
 		}
+
+		switch strings.ToLower(c.ACME.Type) {
+		case "http":
+			cmIssuer.DisableHTTPChallenge = false
+			cmIssuer.DisableTLSALPNChallenge = true
+			cmIssuer.DNS01Solver = nil
+			cmIssuer.AltHTTPPort = c.ACME.HTTP.AltPort
+		case "tls":
+			cmIssuer.DisableHTTPChallenge = true
+			cmIssuer.DisableTLSALPNChallenge = false
+			cmIssuer.DNS01Solver = nil
+			cmIssuer.AltTLSALPNPort = c.ACME.TLS.AltPort
+		case "dns":
+			cmIssuer.DisableHTTPChallenge = true
+			cmIssuer.DisableTLSALPNChallenge = true
+			if c.ACME.DNS.Name == "" {
+				return configError{Field: "acme.dns.name", Err: errors.New("empty DNS provider name")}
+			}
+			if c.ACME.DNS.Config == nil {
+				return configError{Field: "acme.dns.config", Err: errors.New("empty DNS provider config")}
+			}
+			switch strings.ToLower(c.ACME.DNS.Name) {
+			case "cloudflare":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &cloudflare.Provider{
+						APIToken: c.ACME.DNS.Config["cloudflare_api_token"],
+					},
+				}
+			case "duckdns":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &duckdns.Provider{
+						APIToken:       c.ACME.DNS.Config["duckdns_api_token"],
+						OverrideDomain: c.ACME.DNS.Config["duckdns_override_domain"],
+					},
+				}
+			case "gandi":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &gandi.Provider{
+						BearerToken: c.ACME.DNS.Config["gandi_api_token"],
+					},
+				}
+			case "godaddy":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &godaddy.Provider{
+						APIToken: c.ACME.DNS.Config["godaddy_api_token"],
+					},
+				}
+			case "namedotcom":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &namedotcom.Provider{
+						Token:  c.ACME.DNS.Config["namedotcom_token"],
+						User:   c.ACME.DNS.Config["namedotcom_user"],
+						Server: c.ACME.DNS.Config["namedotcom_server"],
+					},
+				}
+			case "vultr":
+				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+					DNSProvider: &vultr.Provider{
+						APIToken: c.ACME.DNS.Config["vultr_api_token"],
+					},
+				}
+			default:
+				return configError{Field: "acme.dns.name", Err: errors.New("unsupported DNS provider")}
+			}
+		case "":
+			// Legacy compatibility mode
+			cmIssuer.DisableHTTPChallenge = c.ACME.DisableHTTP
+			cmIssuer.DisableTLSALPNChallenge = c.ACME.DisableTLSALPN
+			cmIssuer.AltHTTPPort = c.ACME.AltHTTPPort
+			cmIssuer.AltTLSALPNPort = c.ACME.AltTLSALPNPort
+		default:
+			return configError{Field: "acme.type", Err: errors.New("unsupported ACME type")}
+		}
+
 		cmCfg.Issuers = []certmagic.Issuer{cmIssuer}
 		cmCache := certmagic.NewCache(certmagic.CacheOptions{
 			GetConfigForCert: func(cert certmagic.Certificate) (*certmagic.Config, error) {
@@ -532,6 +656,11 @@ func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 		return configError{Field: "resolver.type", Err: errors.New("unsupported resolver type")}
 	}
 
+	// Speed test
+	if c.SpeedTest {
+		uOb = outbounds.NewSpeedtestHandler(uOb)
+	}
+
 	hyConfig.Outbound = &outbounds.PluggableOutboundAdapter{PluggableOutbound: uOb}
 	return nil
 }
@@ -584,9 +713,11 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 }
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
-	tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
-	hyConfig.TrafficLogger = tss
-	go runTrafficStatsServer(trafficStatsListen, tss)
+	if c.TrafficStats.Listen != "" {
+		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
+		hyConfig.TrafficLogger = tss
+		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
+	}
 	return nil
 }
 
@@ -697,6 +828,7 @@ func (c *serverConfig) Config(apiClient api.Api) (*server.Config, error) {
 
 func runServer(cmd *cobra.Command, args []string) {
 	logger.Info("server mode")
+
 	if err := viper.ReadInConfig(); err != nil {
 		logger.Fatal("failed to read server config", zap.Error(err))
 	}
@@ -715,6 +847,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	if err != nil {
 		logger.Fatal("failed to load server config", zap.Error(err))
 	}
+
 	s, err := server.NewServer(hyConfig)
 	if err != nil {
 		logger.Fatal("failed to initialize server", zap.Error(err))
@@ -728,6 +861,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	if !disableUpdateCheck {
 		go runCheckUpdateServer()
 	}
+
 	fmt.Println("cmd 启动定时任务")
 	du := "*/60 * * * * *"
 	if config.Panel.Duration != "" {
@@ -759,12 +893,11 @@ func runServer(cmd *cobra.Command, args []string) {
 	if err = s.Serve(); err != nil {
 		logger.Fatal("failed to serve", zap.Error(err))
 	}
-
 }
 
 func runTrafficStatsServer(listen string, handler http.Handler) {
 	logger.Info("traffic stats server up and running", zap.String("listen", listen))
-	if err := http.ListenAndServe(listen, handler); err != nil {
+	if err := correctnet.HTTPListenAndServe(listen, handler); err != nil {
 		logger.Fatal("failed to serve traffic stats", zap.Error(err))
 	}
 }
@@ -817,7 +950,7 @@ func (l *serverLogger) TCPError(addr net.Addr, id, reqAddr string, err error) {
 	if err == nil {
 		logger.Debug("TCP closed", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr))
 	} else {
-		logger.Error("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr), zap.Error(err))
+		logger.Warn("TCP error", zap.String("addr", addr.String()), zap.String("id", id), zap.String("reqAddr", reqAddr), zap.Error(err))
 	}
 }
 
@@ -829,7 +962,7 @@ func (l *serverLogger) UDPError(addr net.Addr, id string, sessionID uint32, err 
 	if err == nil {
 		logger.Debug("UDP closed", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID))
 	} else {
-		logger.Error("UDP error", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.Error(err))
+		logger.Warn("UDP error", zap.String("addr", addr.String()), zap.String("id", id), zap.Uint32("sessionID", sessionID), zap.Error(err))
 	}
 }
 

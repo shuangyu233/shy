@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ppoonk/shy/core/server"
+	"github.com/apernet/hysteria/core/v2/server"
 )
 
 const (

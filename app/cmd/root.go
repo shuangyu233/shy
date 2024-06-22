@@ -95,7 +95,6 @@ var logFormatMap = map[string]zapcore.EncoderConfig{
 }
 
 func Execute() {
-	rootCmd.AddCommand(serverCmd)
 	err := rootCmd.Execute()
 	if err != nil {
 		os.Exit(1)

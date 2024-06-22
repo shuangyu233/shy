@@ -4,7 +4,7 @@ import (
 	"io"
 	"net"
 
-	"github.com/ppoonk/shy/core/client"
+	"github.com/apernet/hysteria/core/v2/client"
 )
 
 type TCPTunnel struct {

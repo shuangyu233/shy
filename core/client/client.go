@@ -8,10 +8,10 @@ import (
 	"net/url"
 	"time"
 
-	coreErrs "github.com/ppoonk/shy/core/errors"
-	"github.com/ppoonk/shy/core/internal/congestion"
-	"github.com/ppoonk/shy/core/internal/protocol"
-	"github.com/ppoonk/shy/core/internal/utils"
+	coreErrs "github.com/apernet/hysteria/core/v2/errors"
+	"github.com/apernet/hysteria/core/v2/internal/congestion"
+	"github.com/apernet/hysteria/core/v2/internal/protocol"
+	"github.com/apernet/hysteria/core/v2/internal/utils"
 
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
@@ -34,17 +34,23 @@ type HyUDPConn interface {
 	Close() error
 }
 
-func NewClient(config *Config) (Client, error) {
+type HandshakeInfo struct {
+	UDPEnabled bool
+	Tx         uint64 // 0 if using BBR
+}
+
+func NewClient(config *Config) (Client, *HandshakeInfo, error) {
 	if err := config.verifyAndFill(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	c := &clientImpl{
 		config: config,
 	}
-	if err := c.connect(); err != nil {
-		return nil, err
+	info, err := c.connect()
+	if err != nil {
+		return nil, nil, err
 	}
-	return c, nil
+	return c, info, nil
 }
 
 type clientImpl struct {
@@ -56,10 +62,10 @@ type clientImpl struct {
 	udpSM *udpSessionManager
 }
 
-func (c *clientImpl) connect() error {
+func (c *clientImpl) connect() (*HandshakeInfo, error) {
 	pktConn, err := c.config.ConnFactory.New(c.config.ServerAddr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Convert config to TLS config & QUIC config
 	tlsConfig := &tls.Config{
@@ -81,9 +87,8 @@ func (c *clientImpl) connect() error {
 	// Prepare RoundTripper
 	var conn quic.EarlyConnection
 	rt := &http3.RoundTripper{
-		EnableDatagrams: true,
 		TLSClientConfig: tlsConfig,
-		QuicConfig:      quicConfig,
+		QUICConfig:      quicConfig,
 		Dial: func(ctx context.Context, _ string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
 			qc, err := quic.DialEarly(ctx, pktConn, c.config.ServerAddr, tlsCfg, cfg)
 			if err != nil {
@@ -113,22 +118,23 @@ func (c *clientImpl) connect() error {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
 		_ = pktConn.Close()
-		return coreErrs.ConnectError{Err: err}
+		return nil, coreErrs.ConnectError{Err: err}
 	}
 	if resp.StatusCode != protocol.StatusAuthOK {
 		_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		_ = pktConn.Close()
-		return coreErrs.AuthError{StatusCode: resp.StatusCode}
+		return nil, coreErrs.AuthError{StatusCode: resp.StatusCode}
 	}
 	// Auth OK
 	authResp := protocol.AuthResponseFromHeader(resp.Header)
+	var actualTx uint64
 	if authResp.RxAuto {
 		// Server asks client to use bandwidth detection,
 		// ignore local bandwidth config and use BBR
 		congestion.UseBBR(conn)
 	} else {
 		// actualTx = min(serverRx, clientTx)
-		actualTx := authResp.Rx
+		actualTx = authResp.Rx
 		if actualTx == 0 || actualTx > c.config.BandwidthConfig.MaxTx {
 			// Server doesn't have a limit, or our clientTx is smaller than serverRx
 			actualTx = c.config.BandwidthConfig.MaxTx
@@ -147,7 +153,10 @@ func (c *clientImpl) connect() error {
 	if authResp.UDPEnabled {
 		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
 	}
-	return nil
+	return &HandshakeInfo{
+		UDPEnabled: authResp.UDPEnabled,
+		Tx:         actualTx,
+	}, nil
 }
 
 // openStream wraps the stream with QStream, which handles Close() properly
@@ -162,13 +171,13 @@ func (c *clientImpl) openStream() (quic.Stream, error) {
 func (c *clientImpl) TCP(addr string) (net.Conn, error) {
 	stream, err := c.openStream()
 	if err != nil {
-		return nil, maybeWrapQUICClosedError(err)
+		return nil, wrapIfConnectionClosed(err)
 	}
 	// Send request
 	err = protocol.WriteTCPRequest(stream, addr)
 	if err != nil {
 		_ = stream.Close()
-		return nil, maybeWrapQUICClosedError(err)
+		return nil, wrapIfConnectionClosed(err)
 	}
 	if c.config.FastOpen {
 		// Don't wait for the response when fast open is enabled.
@@ -185,7 +194,7 @@ func (c *clientImpl) TCP(addr string) (net.Conn, error) {
 	ok, msg, err := protocol.ReadTCPResponse(stream)
 	if err != nil {
 		_ = stream.Close()
-		return nil, maybeWrapQUICClosedError(err)
+		return nil, wrapIfConnectionClosed(err)
 	}
 	if !ok {
 		_ = stream.Close()
@@ -212,12 +221,14 @@ func (c *clientImpl) Close() error {
 	return nil
 }
 
-// maybeWrapQUICClosedError checks if the error returned by quic-go
-// indicates that the QUIC connection is permanently closed,
-// and if so, wraps it with coreErrs.ClosedError.
-func maybeWrapQUICClosedError(err error) error {
+// wrapIfConnectionClosed checks if the error returned by quic-go
+// indicates that the QUIC connection has been permanently closed,
+// and if so, wraps the error with coreErrs.ClosedError.
+// PITFALL: sometimes quic-go has "internal errors" that are not net.Error,
+// but we still need to treat them as ClosedError.
+func wrapIfConnectionClosed(err error) error {
 	netErr, ok := err.(net.Error)
-	if ok && !netErr.Temporary() {
+	if !ok || !netErr.Temporary() {
 		return coreErrs.ClosedError{Err: err}
 	} else {
 		return err

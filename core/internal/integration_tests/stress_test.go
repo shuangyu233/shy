@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/mock"
 	"golang.org/x/time/rate"
 
-	"github.com/ppoonk/shy/core/client"
-	"github.com/ppoonk/shy/core/internal/integration_tests/mocks"
-	"github.com/ppoonk/shy/core/server"
+	"github.com/apernet/hysteria/core/v2/client"
+	"github.com/apernet/hysteria/core/v2/internal/integration_tests/mocks"
+	"github.com/apernet/hysteria/core/v2/server"
 )
 
 type tcpStressor struct {
@@ -148,7 +148,7 @@ func TestClientServerTCPStress(t *testing.T) {
 	go echoServer.Serve()
 
 	// Create client
-	c, err := client.NewClient(&client.Config{
+	c, _, err := client.NewClient(&client.Config{
 		ServerAddr: udpAddr,
 		TLSConfig:  client.TLSConfig{InsecureSkipVerify: true},
 	})
@@ -192,7 +192,7 @@ func TestClientServerUDPStress(t *testing.T) {
 	go echoServer.Serve()
 
 	// Create client
-	c, err := client.NewClient(&client.Config{
+	c, _, err := client.NewClient(&client.Config{
 		ServerAddr: udpAddr,
 		TLSConfig:  client.TLSConfig{InsecureSkipVerify: true},
 	})

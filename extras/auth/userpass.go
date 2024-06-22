@@ -4,7 +4,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/ppoonk/shy/core/server"
+	"github.com/apernet/hysteria/core/v2/server"
 )
 
 const (

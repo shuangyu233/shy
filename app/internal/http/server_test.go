@@ -10,7 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/ppoonk/shy/core/client"
+	"github.com/apernet/hysteria/core/v2/client"
 )
 
 const (

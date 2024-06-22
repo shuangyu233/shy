@@ -5,12 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/go-resty/resty/v2"
-	"github.com/ppoonk/shy/app/api"
-	"github.com/ppoonk/shy/extras/trafficlogger"
-	"github.com/shirou/gopsutil/cpu"
-	"github.com/shirou/gopsutil/disk"
-	"github.com/shirou/gopsutil/mem"
 	"io"
 	"log"
 	"net"
@@ -19,6 +13,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/apernet/hysteria/extras/v2/trafficlogger"
+	"github.com/go-resty/resty/v2"
+	"github.com/ppoonk/shy/app/api"
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/disk"
+	"github.com/shirou/gopsutil/mem"
 )
 
 const (

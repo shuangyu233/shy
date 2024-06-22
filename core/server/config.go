@@ -6,8 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ppoonk/shy/core/errors"
-	"github.com/ppoonk/shy/core/internal/pmtud"
+	"github.com/apernet/hysteria/core/v2/errors"
+	"github.com/apernet/hysteria/core/v2/internal/pmtud"
+	"github.com/apernet/quic-go"
 )
 
 const (
@@ -22,6 +23,7 @@ type Config struct {
 	TLSConfig             TLSConfig
 	QUICConfig            QUICConfig
 	Conn                  net.PacketConn
+	RequestHook           RequestHook
 	Outbound              Outbound
 	BandwidthConfig       BandwidthConfig
 	IgnoreClientBandwidth bool
@@ -110,6 +112,19 @@ type QUICConfig struct {
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
 }
 
+// RequestHook allows filtering and modifying requests before the server connects to the remote.
+// A request will only be hooked if Check returns true.
+// The returned byte slice, if not empty, will be sent to the remote before proxying - this is
+// mainly for "putting back" the content read from the client for sniffing, etc.
+// Return a non-nil error to abort the connection.
+// Note that due to the current architectural limitations, it can only inspect the first packet
+// of a UDP connection. It also cannot put back any data as the first packet is always sent as-is.
+type RequestHook interface {
+	Check(isUDP bool, reqAddr string) bool
+	TCP(stream quic.Stream, reqAddr *string) ([]byte, error)
+	UDP(data []byte, reqAddr *string) error
+}
+
 // Outbound provides the implementation of how the server should connect to remote servers.
 // Although UDP includes a reqAddr, the implementation does not necessarily have to use it
 // to make a "connected" UDP connection that does not accept packets from other addresses.
@@ -195,5 +210,6 @@ type EventLogger interface {
 // bandwidth limits or post-connection authentication, for example.
 // The implementation of this interface must be thread-safe.
 type TrafficLogger interface {
-	Log(id string, tx, rx uint64) (ok bool)
+	LogTraffic(id string, tx, rx uint64) (ok bool)
+	LogOnlineState(id string, online bool)
 }

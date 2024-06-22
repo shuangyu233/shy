@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/ppoonk/shy/extras/outbounds/acl/v2geo"
+	"github.com/apernet/hysteria/extras/v2/outbounds/acl/v2geo"
 	"github.com/stretchr/testify/assert"
 )
 

@@ -8,7 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/ppoonk/shy/app/internal/utils_test"
+	"github.com/apernet/hysteria/app/v2/internal/utils_test"
 )
 
 func TestServer(t *testing.T) {

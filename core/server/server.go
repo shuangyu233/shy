@@ -9,9 +9,9 @@ import (
 	"github.com/apernet/quic-go"
 	"github.com/apernet/quic-go/http3"
 
-	"github.com/ppoonk/shy/core/internal/congestion"
-	"github.com/ppoonk/shy/core/internal/protocol"
-	"github.com/ppoonk/shy/core/internal/utils"
+	"github.com/apernet/hysteria/core/v2/internal/congestion"
+	"github.com/apernet/hysteria/core/v2/internal/protocol"
+	"github.com/apernet/hysteria/core/v2/internal/utils"
 )
 
 const (
@@ -77,14 +77,18 @@ func (s *serverImpl) Close() error {
 func (s *serverImpl) handleClient(conn quic.Connection) {
 	handler := newH3sHandler(s.config, conn)
 	h3s := http3.Server{
-		EnableDatagrams: true,
-		Handler:         handler,
-		StreamHijacker:  handler.ProxyStreamHijacker,
+		Handler:        handler,
+		StreamHijacker: handler.ProxyStreamHijacker,
 	}
 	err := h3s.ServeQUICConn(conn)
 	// If the client is authenticated, we need to log the disconnect event
-	if handler.authenticated && s.config.EventLogger != nil {
-		s.config.EventLogger.Disconnect(conn.RemoteAddr(), handler.authID, err)
+	if handler.authenticated {
+		if tl := s.config.TrafficLogger; tl != nil {
+			tl.LogOnlineState(handler.authID, false)
+		}
+		if el := s.config.EventLogger; el != nil {
+			el.Disconnect(conn.RemoteAddr(), handler.authID, err)
+		}
 	}
 	_ = conn.CloseWithError(closeErrCodeOK, "")
 }
@@ -154,8 +158,11 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			w.WriteHeader(protocol.StatusAuthOK)
 			// Call event logger
-			if h.config.EventLogger != nil {
-				h.config.EventLogger.Connect(h.conn.RemoteAddr(), id, actualTx)
+			if tl := h.config.TrafficLogger; tl != nil {
+				tl.LogOnlineState(id, true)
+			}
+			if el := h.config.EventLogger; el != nil {
+				el.Connect(h.conn.RemoteAddr(), id, actualTx)
 			}
 			// Initialize UDP session manager (if UDP is enabled)
 			// We use sync.Once to make sure that only one goroutine is started,
@@ -163,7 +170,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !h.config.DisableUDP {
 				go func() {
 					sm := newUDPSessionManager(
-						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.Outbound},
+						&udpIOImpl{h.conn, id, h.config.TrafficLogger, h.config.RequestHook, h.config.Outbound},
 						&udpEventLoggerImpl{h.conn, id, h.config.EventLogger},
 						h.config.UDPIdleTimeout)
 					h.udpSM = sm
@@ -180,7 +187,7 @@ func (h *h3sHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, conn quic.Connection, stream quic.Stream, err error) (bool, error) {
+func (h *h3sHandler) ProxyStreamHijacker(ft http3.FrameType, id quic.ConnectionTracingID, stream quic.Stream, err error) (bool, error) {
 	if err != nil || !h.authenticated {
 		return false, nil
 	}
@@ -204,6 +211,23 @@ func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
 		_ = stream.Close()
 		return
 	}
+	// Call the hook if set
+	var putback []byte
+	var hooked bool
+	if h.config.RequestHook != nil {
+		hooked = h.config.RequestHook.Check(false, reqAddr)
+		// When the hook is enabled, the server should always accept a connection
+		// so that the client will send whatever request the hook wants to see.
+		// This is essentially a server-side fast-open.
+		if hooked {
+			_ = protocol.WriteTCPResponse(stream, true, "RequestHook enabled")
+			putback, err = h.config.RequestHook.TCP(stream, &reqAddr)
+			if err != nil {
+				_ = stream.Close()
+				return
+			}
+		}
+	}
 	// Log the event
 	if h.config.EventLogger != nil {
 		h.config.EventLogger.TCPRequest(h.conn.RemoteAddr(), h.authID, reqAddr)
@@ -211,7 +235,9 @@ func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
 	// Dial target
 	tConn, err := h.config.Outbound.TCP(reqAddr)
 	if err != nil {
-		_ = protocol.WriteTCPResponse(stream, false, err.Error())
+		if !hooked {
+			_ = protocol.WriteTCPResponse(stream, false, err.Error())
+		}
 		_ = stream.Close()
 		// Log the error
 		if h.config.EventLogger != nil {
@@ -219,7 +245,13 @@ func (h *h3sHandler) handleTCPRequest(stream quic.Stream) {
 		}
 		return
 	}
-	_ = protocol.WriteTCPResponse(stream, true, "")
+	if !hooked {
+		_ = protocol.WriteTCPResponse(stream, true, "Connected")
+	}
+	// Put back the data if the hook requested
+	if len(putback) > 0 {
+		_, _ = tConn.Write(putback)
+	}
 	// Start proxying
 	if h.config.TrafficLogger != nil {
 		err = copyTwoWayWithLogger(h.authID, stream, tConn, h.config.TrafficLogger)
@@ -253,6 +285,7 @@ type udpIOImpl struct {
 	Conn          quic.Connection
 	AuthID        string
 	TrafficLogger TrafficLogger
+	RequestHook   RequestHook
 	Outbound      Outbound
 }
 
@@ -269,7 +302,7 @@ func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 			continue
 		}
 		if io.TrafficLogger != nil {
-			ok := io.TrafficLogger.Log(io.AuthID, uint64(len(udpMsg.Data)), 0)
+			ok := io.TrafficLogger.LogTraffic(io.AuthID, uint64(len(udpMsg.Data)), 0)
 			if !ok {
 				// TrafficLogger requested to disconnect the client
 				_ = io.Conn.CloseWithError(closeErrCodeTrafficLimitReached, "")
@@ -282,7 +315,7 @@ func (io *udpIOImpl) ReceiveMessage() (*protocol.UDPMessage, error) {
 
 func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 	if io.TrafficLogger != nil {
-		ok := io.TrafficLogger.Log(io.AuthID, 0, uint64(len(msg.Data)))
+		ok := io.TrafficLogger.LogTraffic(io.AuthID, 0, uint64(len(msg.Data)))
 		if !ok {
 			// TrafficLogger requested to disconnect the client
 			_ = io.Conn.CloseWithError(closeErrCodeTrafficLimitReached, "")
@@ -295,6 +328,14 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 		return nil
 	}
 	return io.Conn.SendDatagram(buf[:msgN])
+}
+
+func (io *udpIOImpl) Hook(data []byte, reqAddr *string) error {
+	if io.RequestHook != nil && io.RequestHook.Check(true, *reqAddr) {
+		return io.RequestHook.UDP(data, reqAddr)
+	} else {
+		return nil
+	}
 }
 
 func (io *udpIOImpl) UDP(reqAddr string) (UDPConn, error) {
