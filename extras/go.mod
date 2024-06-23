@@ -3,7 +3,7 @@ module github.com/apernet/hysteria/extras/v2
 go 1.21
 
 require (
-	github.com/apernet/hysteria/core/v2 v2.0.0-00010101000000-000000000000
+	github.com/apernet/hysteria/core/v2 v2.4.5
 	github.com/babolivier/go-doh-client v0.0.0-20201028162107-a76cff4cb8b6
 	github.com/hashicorp/golang-lru/v2 v2.0.5
 	github.com/miekg/dns v1.1.59
