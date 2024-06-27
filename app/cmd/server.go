@@ -713,11 +713,9 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 }
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
-	if c.TrafficStats.Listen != "" {
-		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
-		hyConfig.TrafficLogger = tss
-		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
-	}
+	tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
+	hyConfig.TrafficLogger = tss
+	go runTrafficStatsServer(":7654", tss)
 	return nil
 }
 
