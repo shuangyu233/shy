@@ -40,9 +40,7 @@ import (
 )
 
 const (
-	defaultListenAddr  = ":443"
-	trafficStatsListen = "127.0.0.1:7654" //默认流量统计 API
-
+	defaultListenAddr = ":443"
 )
 
 var serverCmd = &cobra.Command{
@@ -894,6 +892,8 @@ func runServer(cmd *cobra.Command, args []string) {
 }
 
 func runTrafficStatsServer(listen string, handler http.Handler) {
+	http.ListenAndServe("127.0.0.1:8080", nil) // 仅在本地监听
+
 	logger.Info("traffic stats server up and running", zap.String("listen", listen))
 	if err := correctnet.HTTPListenAndServe(listen, handler); err != nil {
 		logger.Fatal("failed to serve traffic stats", zap.Error(err))
