@@ -35,12 +35,16 @@ import (
 	"github.com/apernet/hysteria/extras/v2/masq"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 	"github.com/apernet/hysteria/extras/v2/outbounds"
+	"github.com/apernet/hysteria/extras/v2/sniff"
 	"github.com/apernet/hysteria/extras/v2/trafficlogger"
+	eUtils "github.com/apernet/hysteria/extras/v2/utils"
 	"github.com/ppoonk/shy/app/api"
 )
 
 const (
-	defaultListenAddr = ":443"
+	defaultListenAddr  = ":443"
+	trafficStatsListen = "127.0.0.1:7654" //默认流量统计 API
+
 )
 
 var serverCmd = &cobra.Command{
@@ -70,6 +74,7 @@ type serverConfig struct {
 	UDPIdleTimeout        time.Duration               `mapstructure:"udpIdleTimeout"`
 	Auth                  serverConfigAuth            `mapstructure:"auth"`
 	Resolver              serverConfigResolver        `mapstructure:"resolver"`
+	Sniff                 serverConfigSniff           `mapstructure:"sniff"`
 	ACL                   serverConfigACL             `mapstructure:"acl"`
 	Outbounds             []serverConfigOutboundEntry `mapstructure:"outbounds"`
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
@@ -183,6 +188,14 @@ type serverConfigResolver struct {
 	UDP   serverConfigResolverUDP   `mapstructure:"udp"`
 	TLS   serverConfigResolverTLS   `mapstructure:"tls"`
 	HTTPS serverConfigResolverHTTPS `mapstructure:"https"`
+}
+
+type serverConfigSniff struct {
+	Enable        bool          `mapstructure:"enable"`
+	Timeout       time.Duration `mapstructure:"timeout"`
+	RewriteDomain bool          `mapstructure:"rewriteDomain"`
+	TCPPorts      string        `mapstructure:"tcpPorts"`
+	UDPPorts      string        `mapstructure:"udpPorts"`
 }
 
 type serverConfigACL struct {
@@ -550,6 +563,29 @@ func serverConfigOutboundHTTPToOutbound(c serverConfigOutboundHTTP) (outbounds.P
 	return outbounds.NewHTTPOutbound(c.URL, c.Insecure)
 }
 
+func (c *serverConfig) fillRequestHook(hyConfig *server.Config) error {
+	if c.Sniff.Enable {
+		s := &sniff.Sniffer{
+			Timeout:       c.Sniff.Timeout,
+			RewriteDomain: c.Sniff.RewriteDomain,
+		}
+		if c.Sniff.TCPPorts != "" {
+			s.TCPPorts = eUtils.ParsePortUnion(c.Sniff.TCPPorts)
+			if s.TCPPorts == nil {
+				return configError{Field: "sniff.tcpPorts", Err: errors.New("invalid port union")}
+			}
+		}
+		if c.Sniff.UDPPorts != "" {
+			s.UDPPorts = eUtils.ParsePortUnion(c.Sniff.UDPPorts)
+			if s.UDPPorts == nil {
+				return configError{Field: "sniff.udpPorts", Err: errors.New("invalid port union")}
+			}
+		}
+		hyConfig.RequestHook = s
+	}
+	return nil
+}
+
 func (c *serverConfig) fillOutboundConfig(hyConfig *server.Config) error {
 	// Resolver, ACL, actual outbound are all implemented through the Outbound interface.
 	// Depending on the config, we build a chain like this:
@@ -711,9 +747,11 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 }
 
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
-	tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
-	hyConfig.TrafficLogger = tss
-	go runTrafficStatsServer(":7654", tss)
+	if c.TrafficStats.Listen != "" {
+		tss := trafficlogger.NewTrafficStatsServer(c.TrafficStats.Secret)
+		hyConfig.TrafficLogger = tss
+		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
+	}
 	return nil
 }
 
@@ -804,6 +842,7 @@ func (c *serverConfig) Config(apiClient api.Api) (*server.Config, error) {
 		c.fillConn,
 		c.fillTLSConfig,
 		c.fillQUICConfig,
+		c.fillRequestHook,
 		c.fillOutboundConfig,
 		c.fillBandwidthConfig,
 		c.fillIgnoreClientBandwidth,
@@ -892,8 +931,6 @@ func runServer(cmd *cobra.Command, args []string) {
 }
 
 func runTrafficStatsServer(listen string, handler http.Handler) {
-	http.ListenAndServe("127.0.0.1:8080", nil) // 仅在本地监听
-
 	logger.Info("traffic stats server up and running", zap.String("listen", listen))
 	if err := correctnet.HTTPListenAndServe(listen, handler); err != nil {
 		logger.Fatal("failed to serve traffic stats", zap.Error(err))
